@@ -34,6 +34,7 @@ type clientCodec struct {
 	// and then look it up by request ID when filling out the rpc Response.
 	mutex   sync.Mutex        // protects pending
 	pending map[uint64]string // map request id to method name
+	um      chan []byte       // channel that receives unhandled messages
 }
 
 // NewClientCodec returns a new rpc.ClientCodec using JSON-RPC 2.0 on conn.
@@ -43,6 +44,7 @@ func NewClientCodec(conn io.ReadWriteCloser) rpc.ClientCodec {
 		enc:     json.NewEncoder(conn),
 		c:       conn,
 		pending: make(map[uint64]string),
+		um:      make(chan []byte),
 	}
 }
 
@@ -112,6 +114,7 @@ type clientResponse struct {
 	ID      *uint64          `json:"id"`
 	Result  *json.RawMessage `json:"result"`
 	Error   *Error           `json:"error"`
+	raw     []byte
 }
 
 func (r *clientResponse) reset() {
@@ -119,10 +122,12 @@ func (r *clientResponse) reset() {
 	r.ID = nil
 	r.Result = nil
 	r.Error = nil
+	r.raw = nil
 }
 
 func (r *clientResponse) UnmarshalJSON(raw []byte) error {
 	r.reset()
+	r.raw = raw
 	type resp *clientResponse
 	if err := json.Unmarshal(raw, resp(r)); err != nil {
 		return errors.New("bad response: " + string(raw))
@@ -173,12 +178,21 @@ func (c *clientCodec) ReadResponseHeader(r *rpc.Response) error {
 	// - it will be returned as is for all pending calls
 	// - client will be shutdown
 	// So, return io.EOF as is, return *Error for all other errors.
-	if err := c.dec.Decode(&c.resp); err != nil {
+
+	err := c.dec.Decode(&c.resp)
+
+	for err != nil {
 		if err == io.EOF {
 			return err
 		}
-		return NewError(errInternal.Code, err.Error())
+		msg := make([]byte, len(c.resp.raw))
+		copy(msg, c.resp.raw)
+		go (func(c chan<- []byte, m []byte) {
+			c <- m
+		})(c.um, msg)
+		err = c.dec.Decode(&c.resp)
 	}
+
 	if c.resp.ID == nil {
 		return c.resp.Error
 	}
@@ -236,6 +250,10 @@ func (c Client) Notify(serviceMethod string, args interface{}) error {
 		Seq:           seqNotify,
 	}
 	return c.codec.WriteRequest(req, args)
+}
+
+func (c Client) GetUnhandledChannel() chan []byte {
+	return c.codec.um
 }
 
 // NewClient returns a new Client to handle requests to the
