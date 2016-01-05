@@ -16,6 +16,7 @@ import (
 	"net/rpc"
 	"reflect"
 	"sync"
+	"github.com/grafov/bcast"
 )
 
 const seqNotify = math.MaxUint64
@@ -34,18 +35,22 @@ type clientCodec struct {
 	// and then look it up by request ID when filling out the rpc Response.
 	mutex   sync.Mutex        // protects pending
 	pending map[uint64]string // map request id to method name
-	um      chan []byte       // channel that receives unhandled messages
+	group   *bcast.Group      // channel that receives unhandled messages
 }
 
 // NewClientCodec returns a new rpc.ClientCodec using JSON-RPC 2.0 on conn.
 func NewClientCodec(conn io.ReadWriteCloser) rpc.ClientCodec {
-	return &clientCodec{
+	cc := &clientCodec{
 		dec:     json.NewDecoder(conn),
 		enc:     json.NewEncoder(conn),
 		c:       conn,
 		pending: make(map[uint64]string),
-		um:      make(chan []byte),
+		group:   bcast.NewGroup(),
 	}
+
+	go cc.group.Broadcasting(0)
+
+	return cc
 }
 
 type clientRequest struct {
@@ -187,9 +192,8 @@ func (c *clientCodec) ReadResponseHeader(r *rpc.Response) error {
 		}
 		msg := make([]byte, len(c.resp.raw))
 		copy(msg, c.resp.raw)
-		go (func(c chan<- []byte, m []byte) {
-			c <- m
-		})(c.um, msg)
+		go c.group.Send(msg)
+
 		err = c.dec.Decode(&c.resp)
 	}
 
@@ -252,8 +256,10 @@ func (c Client) Notify(serviceMethod string, args interface{}) error {
 	return c.codec.WriteRequest(req, args)
 }
 
-func (c Client) GetUnhandledChannel() chan []byte {
-	return c.codec.um
+func (c Client) GetUnhandledChannel() chan interface{} {
+	member := c.codec.group.Join()
+
+	return member.In
 }
 
 // NewClient returns a new Client to handle requests to the
